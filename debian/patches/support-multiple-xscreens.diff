@@ -1,0 +1,186 @@
+Enable correct keyboard focus when multiple i3 instances are used on multiple Xscreens
+--- a/include/xcb.h
++++ b/include/xcb.h
+@@ -54,6 +54,7 @@
+                          XCB_EVENT_MASK_POINTER_MOTION |                                              \
+                          XCB_EVENT_MASK_PROPERTY_CHANGE |                                             \
+                          XCB_EVENT_MASK_FOCUS_CHANGE |                                                \
++                         XCB_EVENT_MASK_LEAVE_WINDOW |                                                \
+                          XCB_EVENT_MASK_ENTER_WINDOW)
+ 
+ #define xmacro(atom) xcb_atom_t A_##atom;
+--- a/src/handlers.c
++++ b/src/handlers.c
+@@ -21,6 +21,7 @@
+ int xkb_base = -1;
+ int xkb_current_group;
+ int shape_base = -1;
++extern uint8_t previous_screen;
+ 
+ /* After mapping/unmapping windows, a notify event is generated. However, we don’t want it,
+    since it’d trigger an infinite loop of switching between the different windows when
+@@ -87,7 +88,7 @@
+  * current workspace, if so.
+  *
+  */
+-static void check_crossing_screen_boundary(uint32_t x, uint32_t y) {
++static void check_crossing_screen_boundary(uint32_t x, uint32_t y, bool force_treerender) {
+     Output *output;
+ 
+     /* If the user disable focus follows mouse, we have nothing to do here */
+@@ -113,21 +114,40 @@
+     con_focus(next);
+ 
+     /* If the focus changed, we re-render to get updated decorations */
+-    if (old_focused != focused)
++    if (old_focused != focused || force_treerender)
+         tree_render();
+ }
+ 
+ /*
++ * This is called when the pointer leaves the root window
++ *
++ */
++static void handle_leave_notify(xcb_enter_notify_event_t *event) {
++    DLOG("leave_notify for %08x, mode = %d, detail %d, serial %d, focus %d\n",
++         event->event, event->mode, event->detail, event->sequence,
++         event->same_screen_focus);
++
++    if (event->mode != XCB_NOTIFY_MODE_NORMAL) {
++        DLOG("This was not a normal notify, ignoring\n");
++        return;
++    }
++
++    /* When leaving we don't care about the previous value */
++    previous_screen = event->same_screen_focus;
++    return;
++}
++
++/*
+  * When the user moves the mouse pointer onto a window, this callback gets called.
+  *
+  */
+ static void handle_enter_notify(xcb_enter_notify_event_t *event) {
+     Con *con;
+-
+     last_timestamp = event->time;
+ 
+-    DLOG("enter_notify for %08x, mode = %d, detail %d, serial %d\n",
+-         event->event, event->mode, event->detail, event->sequence);
++    DLOG("enter_notify for %08x, mode = %d, detail %d, serial %d, focus %d\n",
++         event->event, event->mode, event->detail, event->sequence,
++         event->same_screen_focus);
+     DLOG("coordinates %d, %d\n", event->event_x, event->event_y);
+     if (event->mode != XCB_NOTIFY_MODE_NORMAL) {
+         DLOG("This was not a normal notify, ignoring\n");
+@@ -140,6 +160,18 @@
+         return;
+     }
+ 
++    bool focus_crossed_screen = false;
++    if (event->same_screen_focus != previous_screen) {
++        /* Note we should not skip on previous_screen being
++         * UINT8_MAX because we don't want the first display
++         * switch to be missed (say we have i3 on :0.0 and :0.1,
++         * the :0.1 i3 will not get an event in general until
++         * the first time the user tries to use it, since the
++         * mouse pointer is likely on :0.0 to start with */
++        DLOG("The user changed screens %d -> %d\n", previous_screen, event->same_screen_focus);
++        focus_crossed_screen = true;
++    }
++
+     bool enter_child = false;
+     /* Get container by frame or by child window */
+     if ((con = con_by_frame_id(event->event)) == NULL) {
+@@ -152,7 +184,12 @@
+      * workspace on the correct output. */
+     if (con == NULL || con->parent->type == CT_DOCKAREA) {
+         DLOG("Getting screen at %d x %d\n", event->root_x, event->root_y);
+-        check_crossing_screen_boundary(event->root_x, event->root_y);
++        /* The user entered the root window coming from another X
++         * screen, this means that the above will not have called
++         * tree_render (leaving the keyboard focus on the other
++         * screen). Force a rerender depending on focus_crossed_screen.
++         */
++        check_crossing_screen_boundary(event->root_x, event->root_y, focus_crossed_screen);
+         return;
+     }
+ 
+@@ -171,20 +208,23 @@
+     if (config.disable_focus_follows_mouse)
+         return;
+ 
+-    /* if this container is already focused, there is nothing to do. */
+-    if (con == focused)
++    /* if this container is already focused, there is nothing to do.
++     * unless we have switched screens */
++    if (con == focused && !focus_crossed_screen)
+         return;
+ 
+     /* Get the currently focused workspace to check if the focus change also
+-     * involves changing workspaces. If so, we need to call workspace_show() to
+-     * correctly update state and send the IPC event. */
++     * involves changing workspaces. If so, or if we switched screens, we need
++     * to call workspace_show() to correctly update state and send the IPC
++     * event. */
+     Con *ws = con_get_workspace(con);
+-    if (ws != con_get_workspace(focused))
++    if (ws != con_get_workspace(focused) || focus_crossed_screen)
+         workspace_show(ws);
+ 
+     focused_id = XCB_NONE;
+     con_focus(con_descend_focused(con));
+     tree_render();
++    previous_screen = event->same_screen_focus;
+ }
+ 
+ /*
+@@ -204,7 +244,7 @@
+     Con *con;
+     if ((con = con_by_frame_id(event->event)) == NULL) {
+         DLOG("MotionNotify for an unknown container, checking if it crosses screen boundaries.\n");
+-        check_crossing_screen_boundary(event->root_x, event->root_y);
++        check_crossing_screen_boundary(event->root_x, event->root_y, false);
+         return;
+     }
+ 
+@@ -1461,6 +1501,10 @@
+             handle_enter_notify((xcb_enter_notify_event_t *)event);
+             break;
+ 
++        case XCB_LEAVE_NOTIFY:
++            handle_leave_notify((xcb_enter_notify_event_t *)event);
++            break;
++
+         /* Client message are sent to the root window. The only interesting
+          * client message for us is _NET_WM_STATE, we honour
+          * _NET_WM_STATE_FULLSCREEN and _NET_WM_STATE_DEMANDS_ATTENTION */
+--- a/src/main.c
++++ b/src/main.c
+@@ -39,6 +39,8 @@
+  * temporarily for drag_pointer(). */
+ static struct ev_prepare *xcb_prepare;
+ 
++extern uint8_t previous_screen;
++
+ char **start_argv;
+ 
+ xcb_connection_t *conn;
+@@ -547,6 +549,7 @@
+ 
+     root_screen = xcb_aux_get_screen(conn, conn_screen);
+     root = root_screen->root;
++    previous_screen = UINT8_MAX;
+ 
+     /* Place requests for the atoms we need as soon as possible */
+ #define xmacro(atom) \
+--- a/src/tree.c
++++ b/src/tree.c
+@@ -11,6 +11,7 @@
+ 
+ struct Con *croot;
+ struct Con *focused;
++uint8_t previous_screen;
+ 
+ struct all_cons_head all_cons = TAILQ_HEAD_INITIALIZER(all_cons);
+ 
